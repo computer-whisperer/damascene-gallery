@@ -19,6 +19,19 @@ use damascene_winit_wgpu::Wakeup;
 use crate::convert::{self, ImageMeta};
 use crate::decode;
 
+/// The host's wakeup handle, shared by everything that produces results
+/// off-thread (decode workers, the folder-picker dialog thread). The
+/// host delivers exactly one [`Wakeup`] — which isn't `Clone` — so it
+/// lives behind an `Arc` and is `None` until the event loop starts.
+pub type SharedWakeup = Arc<Mutex<Option<Wakeup>>>;
+
+/// Wake the host loop for a frame, if it exists yet.
+pub fn wake(wakeup: &SharedWakeup) {
+    if let Some(w) = wakeup.lock().unwrap().as_ref() {
+        w.wake();
+    }
+}
+
 /// Long edge of grid thumbnails, in pixels. f16 linear RGBA → ~0.7 MB per
 /// 16:9 thumb; a 300-file collection stays around 200 MB resident.
 pub const THUMB_EDGE: u32 = 384;
@@ -63,7 +76,7 @@ struct Shared {
     queue: Mutex<Queue>,
     cond: Condvar,
     results: Mutex<Sender<Loaded>>,
-    wakeup: Mutex<Option<Wakeup>>,
+    wakeup: SharedWakeup,
     files: Vec<PathBuf>,
 }
 
@@ -86,7 +99,11 @@ impl LoaderResults {
 impl Loader {
     /// Spawn `workers` decode threads over `files`. The whole collection
     /// is queued for the thumbnail sweep immediately.
-    pub fn spawn(files: Vec<PathBuf>, workers: usize) -> (Loader, LoaderResults) {
+    pub fn spawn(
+        files: Vec<PathBuf>,
+        workers: usize,
+        wakeup: SharedWakeup,
+    ) -> (Loader, LoaderResults) {
         let (tx, rx) = channel();
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
@@ -98,7 +115,7 @@ impl Loader {
             }),
             cond: Condvar::new(),
             results: Mutex::new(tx),
-            wakeup: Mutex::new(None),
+            wakeup,
             files,
         });
         for n in 0..workers {
@@ -111,9 +128,17 @@ impl Loader {
         (Loader { shared }, LoaderResults { rx })
     }
 
-    /// Hand over the host's wakeup handle once the event loop exists.
-    pub fn set_wakeup(&self, wakeup: Wakeup) {
-        *self.shared.wakeup.lock().unwrap() = Some(wakeup);
+    /// Stop the worker pool: clear the queues and wake every worker so
+    /// it exits. Called when the app swaps to a new collection — jobs
+    /// already mid-decode finish and post into the old (now dropped)
+    /// channel, which is harmless.
+    pub fn shutdown(&self) {
+        let mut q = self.shared.queue.lock().unwrap();
+        q.shutdown = true;
+        q.full.clear();
+        q.thumb_hot.clear();
+        q.thumb_sweep.clear();
+        self.shared.cond.notify_all();
     }
 
     /// Jump a thumbnail to the front of the queue (a grid row realized
@@ -214,10 +239,8 @@ fn worker(shared: Arc<Shared>) {
         shared.queue.lock().unwrap().pending.remove(&(kind, index));
 
         if shared.results.lock().unwrap().send(result).is_err() {
-            return; // app gone
+            return; // receiver gone (collection swapped or app exited)
         }
-        if let Some(w) = shared.wakeup.lock().unwrap().as_ref() {
-            w.wake();
-        }
+        wake(&shared.wakeup);
     }
 }

@@ -11,8 +11,12 @@ them with correct color via `wp_color_management_v1`.
 </p>
 
 ```
-damascene-gallery [DIRECTORY | FILE...]     # default: .
+damascene-gallery [DIRECTORY | FILE...]
 ```
+
+Without arguments the app opens on a welcome screen; **Open Folder**
+launches the system directory picker (XDG desktop portal, via `rfd`),
+from there and from the gallery toolbar.
 
 ## Controls
 
@@ -23,6 +27,7 @@ damascene-gallery [DIRECTORY | FILE...]     # default: .
 | Esc | back to grid |
 | Home / End | first / last image |
 | `t` | viewer: toggle SDR preview (tonemap to reference white) |
+| `o` | open a different folder (system picker) |
 
 ## Architecture
 
@@ -45,11 +50,13 @@ damascene-gallery [DIRECTORY | FILE...]     # default: .
   full-size requests, then thumbnails for rows the grid actually
   realized, then the background sweep in file order. Results wake the
   host's 0 fps idle loop via `HostConfig::with_external_wakeup`.
-- **`src/app.rs`**: damascene `App` — virtualized grid (`virtual_list`,
-  one El row per grid row), full-size viewer with an LRU of 5 decoded
-  4K frames and ±1 prefetch. The toolbar badge shows what the host
-  negotiated: green `HDR · linear` when an extended-range surface is
-  attached, `SDR` otherwise.
+- **`src/app.rs`**: damascene `App` — welcome screen (empty state with
+  the folder picker; the picker dialog runs on its own thread and the
+  result swaps in a fresh collection + loader pool), virtualized grid
+  (`virtual_list`, one El row per grid row), full-size viewer with an
+  LRU of 5 decoded 4K frames and ±1 prefetch. The toolbar badge shows
+  what the host negotiated: green `HDR · linear` when an extended-range
+  surface is attached, `SDR` otherwise.
 
 HDR output negotiates per-output (`ColorPreferences::hdr_extended`) and
 follows the window live across HDR/SDR outputs. Luminance fitting is

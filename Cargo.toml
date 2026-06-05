@@ -12,6 +12,9 @@ authors = ["Christian Balcom"]
 anyhow = "1"
 half = { version = "2.6", features = ["bytemuck"] }
 lru = "0.18"
+# Folder picker: XDG-portal-backed system dialog (default backend talks
+# to org.freedesktop.portal.FileChooser directly; no GTK link).
+rfd = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

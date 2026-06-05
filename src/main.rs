@@ -7,11 +7,13 @@
 //! `wp_color_management_v1` for an extended-range scRGB swapchain on HDR
 //! outputs, so HDR wallpapers display with real highlights.
 //!
-//! Usage: `damascene-gallery [DIRECTORY | FILE...]` (default `.`).
+//! Usage: `damascene-gallery [DIRECTORY | FILE...]` — without arguments
+//! the app opens on a welcome screen with a system folder picker.
 
 mod app;
 mod convert;
 mod loader;
+mod scan;
 
 // The image input pipeline is copied from prism-bg (2026-06-05), which
 // stays unpublished. Kept close to upstream for easy diffing — wallpaper-
@@ -23,55 +25,13 @@ mod color;
 #[allow(dead_code)]
 mod decode;
 
-use std::path::PathBuf;
-
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use damascene_core::color::ColorPreferences;
 use damascene_core::Rect;
 use damascene_winit_wgpu::{run_with_config, HostConfig};
 
 use app::GalleryApp;
-use loader::Loader;
-
-/// Extensions worth queuing for decode. Dispatch inside the pipeline is
-/// by magic bytes; this only filters the directory scan.
-const EXTENSIONS: &[&str] = &[
-    "jxr", "jxl", "avif", "png", "jpg", "jpeg", "webp", "exr", "hdr",
-];
-
-fn scan(args: Vec<String>) -> Result<Vec<PathBuf>> {
-    let inputs = if args.is_empty() {
-        vec![".".to_string()]
-    } else {
-        args
-    };
-
-    let mut files = Vec::new();
-    for input in inputs {
-        let path = PathBuf::from(&input);
-        if path.is_dir() {
-            for entry in
-                std::fs::read_dir(&path).with_context(|| format!("reading directory {input}"))?
-            {
-                let p = entry?.path();
-                let ext = p
-                    .extension()
-                    .map(|e| e.to_string_lossy().to_lowercase())
-                    .unwrap_or_default();
-                if p.is_file() && EXTENSIONS.contains(&ext.as_str()) {
-                    files.push(p);
-                }
-            }
-        } else if path.is_file() {
-            files.push(path);
-        } else {
-            bail!("{input}: not a file or directory");
-        }
-    }
-    files.sort();
-    files.dedup();
-    Ok(files)
-}
+use loader::SharedWakeup;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -81,11 +41,15 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let files = scan(std::env::args().skip(1).collect())?;
-    if files.is_empty() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let explicit = !args.is_empty();
+    let files = scan::scan_args(args)?;
+    if explicit && files.is_empty() {
+        // An explicit path with nothing usable is a CLI error; with no
+        // arguments the app opens on the welcome screen instead.
         bail!(
             "no supported images found (looked for: {})",
-            EXTENSIONS.join(", ")
+            scan::EXTENSIONS.join(", ")
         );
     }
     tracing::info!(count = files.len(), "collection scanned");
@@ -93,16 +57,18 @@ fn main() -> Result<()> {
     let workers = std::thread::available_parallelism()
         .map(|n| (n.get() / 2).clamp(2, 6))
         .unwrap_or(2);
-    let (loader, results) = Loader::spawn(files.clone(), workers);
 
-    let app = GalleryApp::new(files, loader.clone(), results);
+    // One wakeup handle shared by decode workers and dialog threads;
+    // filled in once the event loop exists.
+    let wakeup = SharedWakeup::default();
+    let app = GalleryApp::new(files, workers, wakeup.clone());
 
     let config = HostConfig::default()
         .with_app_id("damascene-gallery")
         // Extended-range linear swapchain on HDR outputs; degrades to
         // P3/sRGB per compositor capability.
         .with_color_preferences(ColorPreferences::hdr_extended())
-        .with_external_wakeup(move |wakeup| loader.set_wakeup(wakeup));
+        .with_external_wakeup(move |w| *wakeup.lock().unwrap() = Some(w));
 
     let viewport = Rect::new(0.0, 0.0, 1600.0, 1000.0);
     run_with_config("Damascene Gallery", viewport, app, config)

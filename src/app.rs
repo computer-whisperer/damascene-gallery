@@ -1,5 +1,6 @@
-//! The gallery [`App`]: a virtualized thumbnail grid over the collection,
-//! and a full-size viewer with keyboard navigation.
+//! The gallery [`App`]: a welcome screen with a system folder picker, a
+//! virtualized thumbnail grid over the open collection, and a full-size
+//! viewer with keyboard navigation.
 //!
 //! All decode work happens on the loader threads; this module only moves
 //! `Image` handles (cheap `Arc` clones) into the El tree. Thumbnails fill
@@ -9,6 +10,7 @@
 use std::cell::{Cell, RefCell};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver};
 
 use damascene_core::prelude::*;
 use damascene_core::scroll::{ScrollAlignment, ScrollRequest};
@@ -16,7 +18,8 @@ use damascene_core::{BuildCx, KeyChord, UiEvent, UiEventKind, UiKey};
 use lru::LruCache;
 
 use crate::convert::ImageMeta;
-use crate::loader::{JobKind, Loaded, Loader, LoaderResults};
+use crate::loader::{self, JobKind, Loaded, Loader, LoaderResults, SharedWakeup};
+use crate::scan;
 
 /// Grid tile geometry (logical px). Wallpaper-shaped (16:10) tiles; the
 /// thumbnail covers the tile, cropping a little on mismatched aspects.
@@ -60,10 +63,21 @@ pub struct GalleryApp {
 
     loader: Loader,
     results: LoaderResults,
+
+    /// Worker count and wakeup handle, kept so a newly picked folder
+    /// can spawn a replacement loader pool.
+    workers: usize,
+    wakeup: SharedWakeup,
+    /// Folder dialog in flight: the picker thread sends the chosen
+    /// directory (or `None` on cancel) and pokes the wakeup.
+    picker: Option<Receiver<Option<PathBuf>>>,
+    /// Last open-folder problem (empty folder, unreadable dir) — shown
+    /// on the welcome screen / as a toolbar badge until the next open.
+    notice: Option<String>,
 }
 
 impl GalleryApp {
-    pub fn new(files: Vec<PathBuf>, loader: Loader, results: LoaderResults) -> Self {
+    pub fn new(files: Vec<PathBuf>, workers: usize, wakeup: SharedWakeup) -> Self {
         let n = files.len();
         let names = files
             .iter()
@@ -73,6 +87,7 @@ impl GalleryApp {
                     .unwrap_or_else(|| p.display().to_string())
             })
             .collect();
+        let (loader, results) = Loader::spawn(files.clone(), workers, wakeup.clone());
         Self {
             files,
             names,
@@ -89,6 +104,71 @@ impl GalleryApp {
             scroll_requests: RefCell::new(Vec::new()),
             loader,
             results,
+            workers,
+            wakeup,
+            picker: None,
+            notice: None,
+        }
+    }
+
+    /// Swap the whole collection for `files`: stop the old worker pool
+    /// (its in-flight results go to a dropped channel) and rebuild every
+    /// per-collection field via `new`.
+    fn open_collection(&mut self, files: Vec<PathBuf>) {
+        self.loader.shutdown();
+        let picker = self.picker.take();
+        *self = Self::new(files, self.workers, self.wakeup.clone());
+        self.picker = picker;
+    }
+
+    /// Launch the system folder picker (XDG portal) on its own thread —
+    /// the dialog blocks until dismissed, and the UI keeps rendering.
+    fn open_folder_dialog(&mut self) {
+        if self.picker.is_some() {
+            return; // one dialog at a time
+        }
+        let (tx, rx) = channel();
+        self.picker = Some(rx);
+        let wakeup = self.wakeup.clone();
+        let start_dir = self
+            .files
+            .first()
+            .and_then(|p| p.parent())
+            .map(PathBuf::from);
+        std::thread::Builder::new()
+            .name("folder-picker".into())
+            .spawn(move || {
+                let mut dialog = rfd::FileDialog::new().set_title("Open image folder");
+                if let Some(dir) = start_dir {
+                    dialog = dialog.set_directory(dir);
+                }
+                let _ = tx.send(dialog.pick_folder());
+                loader::wake(&wakeup);
+            })
+            .expect("spawning folder picker");
+    }
+
+    /// Picker outcome, if the dialog thread reported one this frame.
+    fn drain_picker(&mut self) {
+        let Some(rx) = &self.picker else { return };
+        let picked = match rx.try_recv() {
+            Ok(picked) => picked,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.picker = None;
+        let Some(dir) = picked else { return }; // cancelled
+        match scan::scan_dir(&dir) {
+            Ok(files) if files.is_empty() => {
+                self.notice = Some(format!("no supported images in {}", dir.display()));
+            }
+            Ok(files) => {
+                tracing::info!(count = files.len(), dir = %dir.display(), "folder opened");
+                self.open_collection(files);
+            }
+            Err(e) => {
+                self.notice = Some(format!("{e:#}"));
+            }
         }
     }
 
@@ -122,6 +202,60 @@ impl GalleryApp {
                 self.loader.request_full(idx);
             }
         }
+    }
+
+    /// Empty state: nothing open yet (or the picked folder had nothing).
+    /// Centered card with the folder picker as the primary action — the
+    /// shadcn empty-state shape composed from damascene primitives.
+    fn welcome(&self, cx: &BuildCx) -> El {
+        let mut body = vec![
+            icon("folder")
+                .icon_size(40.0)
+                .text_color(tokens::MUTED_FOREGROUND),
+            h3("No folder open"),
+            // Single-line text rows, not `paragraph`: a Hug ancestor
+            // (the card) measures wrapped text at its unwrapped height,
+            // so the card comes out short and the body overflows it —
+            // damascene layout bug, caught by the Overflow lint.
+            text("Browse folders of images — HDR formats included.").muted(),
+            text("JPEG XR · JXL · AVIF · EXR · Radiance · PNG · JPEG · WebP")
+                .caption()
+                .muted(),
+        ];
+        if let Some(notice) = &self.notice {
+            body.push(badge(notice.clone()).warning().key("notice"));
+        }
+        body.push(
+            button_with_icon("folder", "Open Folder…")
+                .primary()
+                .key("open-folder"),
+        );
+        body.push(
+            text("o opens this dialog · or pass a path: damascene-gallery DIR")
+                .caption()
+                .muted(),
+        );
+
+        column([
+            toolbar([
+                toolbar_title("Damascene Gallery"),
+                spacer(),
+                color_mode_badge(cx),
+            ]),
+            column([card([column(body)
+                .gap(tokens::SPACE_3)
+                .align(Align::Center)
+                .padding(tokens::SPACE_8)
+                // Fixed body width: the default card stretches Fill.
+                .width(Size::Fixed(480.0))])])
+            .align(Align::Center)
+            .justify(Justify::Center)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0)),
+        ])
+        .gap(tokens::SPACE_3)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
     }
 
     fn grid(&self, cx: &BuildCx) -> El {
@@ -164,7 +298,7 @@ impl GalleryApp {
                     (None, Some(err)) => {
                         tip = format!("{} — {err}", names[i]);
                         column([
-                            icon("triangle-alert"),
+                            icon("alert-circle"),
                             text(names[i].clone()).caption().muted(),
                         ])
                         .gap(tokens::SPACE_2)
@@ -192,18 +326,33 @@ impl GalleryApp {
             row_el(cells)
         });
 
+        let mut bar = vec![
+            toolbar_title("Damascene Gallery"),
+            toolbar_description(format!(
+                "{} files — {} loaded",
+                self.files.len(),
+                self.loaded_count
+            )),
+            spacer(),
+        ];
+        if let Some(notice) = &self.notice {
+            bar.push(
+                badge("folder skipped")
+                    .warning()
+                    .key("notice")
+                    .tooltip(format!("{notice} — previous collection kept")),
+            );
+        }
+        bar.push(color_mode_badge(cx));
+        bar.push(
+            button_with_icon("folder", "Open Folder")
+                .key("open-folder")
+                .tooltip("open a different folder (o)"),
+        );
+        bar.push(text("Enter to view · arrows to move").caption().muted());
+
         column([
-            toolbar([
-                toolbar_title("Damascene Gallery"),
-                toolbar_description(format!(
-                    "{} files — {} loaded",
-                    self.files.len(),
-                    self.loaded_count
-                )),
-                spacer(),
-                color_mode_badge(cx),
-                text("Enter to view · arrows to move").caption().muted(),
-            ]),
+            toolbar(bar),
             card([list
                 .key("grid")
                 .height(Size::Fill(1.0))
@@ -237,7 +386,7 @@ impl GalleryApp {
                 .dynamic_range_limit(limit)
                 .width(Size::Fill(1.0))
                 .height(Size::Fill(1.0)),
-            (None, Some(err)) => column([icon("triangle-alert"), text(err.clone()).muted()])
+            (None, Some(err)) => column([icon("alert-circle"), text(err.clone()).muted()])
                 .gap(tokens::SPACE_3)
                 .align(Align::Center)
                 .justify(Justify::Center)
@@ -292,6 +441,7 @@ impl GalleryApp {
 
 impl App for GalleryApp {
     fn before_build(&mut self) {
+        self.drain_picker();
         for loaded in self.results.drain() {
             match loaded {
                 Loaded::Thumb { index, image, meta } => {
@@ -317,9 +467,13 @@ impl App for GalleryApp {
     }
 
     fn build(&self, cx: &BuildCx) -> El {
-        let page = match self.mode {
-            Mode::Grid => self.grid(cx),
-            Mode::Viewer => self.viewer(),
+        let page = if self.files.is_empty() {
+            self.welcome(cx)
+        } else {
+            match self.mode {
+                Mode::Grid => self.grid(cx),
+                Mode::Viewer => self.viewer(),
+            }
         };
         // Page scaffold (the hero-fixture idiom): a themed background
         // layer under content padded in from the window edges — rounded
@@ -355,18 +509,32 @@ impl App for GalleryApp {
             (KeyChord::vim('j'), "down".into()),
             (KeyChord::vim('k'), "up".into()),
             (KeyChord::vim('t'), "sdr-preview".into()),
+            (KeyChord::vim('o'), "open-folder".into()),
         ]
     }
 
     fn on_event(&mut self, event: UiEvent) {
-        let last = self.files.len().saturating_sub(1);
-        let cols = self.cols.get().max(1);
+        // Folder picking works from every screen (welcome button, grid
+        // toolbar button, `o` anywhere).
+        if event.is_click_or_activate("open-folder") || event.is_hotkey("open-folder") {
+            self.open_folder_dialog();
+            return;
+        }
 
         if event.kind == UiEventKind::Escape {
             self.mode = Mode::Grid;
-            self.select(self.selected); // re-anchor the grid scroll
+            if !self.files.is_empty() {
+                self.select(self.selected); // re-anchor the grid scroll
+            }
             return;
         }
+
+        // Everything below navigates the collection.
+        if self.files.is_empty() {
+            return;
+        }
+        let last = self.files.len().saturating_sub(1);
+        let cols = self.cols.get().max(1);
 
         if let Some(key) = event.target_key() {
             if let Some(i) = key.strip_prefix("thumb:").and_then(|s| s.parse().ok()) {
@@ -465,8 +633,7 @@ mod tests {
         let files: Vec<PathBuf> = (0..7)
             .map(|i| PathBuf::from(format!("{i:03}.jxr")))
             .collect();
-        let (loader, results) = Loader::spawn(files.clone(), 1);
-        let mut app = GalleryApp::new(files, loader, results);
+        let mut app = GalleryApp::new(files, 1, SharedWakeup::default());
         let px = Image::from_rgba8(2, 2, vec![128u8; 16]);
         for i in [0usize, 1, 3, 5] {
             app.thumbs[i] = Some(px.clone());
@@ -501,11 +668,78 @@ mod tests {
 
     #[test]
     fn grid_tree_lints_clean() {
-        let app = test_app();
+        let mut app = test_app();
         let findings = lint_findings(&app);
         assert!(
             findings.is_empty(),
             "grid lint findings:\n{}",
+            findings.join("\n")
+        );
+
+        // A failed open keeps the collection and shows a toolbar badge.
+        app.notice = Some("no supported images in /tmp/empty".into());
+        let findings = lint_findings(&app);
+        assert!(
+            findings.is_empty(),
+            "grid (notice) lint findings:\n{}",
+            findings.join("\n")
+        );
+    }
+
+    /// Swapping collections (the folder picker's path) rebuilds all
+    /// per-collection state and returns to a fresh grid.
+    #[test]
+    fn open_collection_resets_state() {
+        let mut app = test_app();
+        app.mode = Mode::Viewer;
+        app.selected = 5;
+        app.sdr_preview = true;
+
+        app.open_collection(vec![PathBuf::from("other.jxr")]);
+
+        assert_eq!(app.files.len(), 1);
+        assert_eq!(app.selected, 0);
+        assert!(app.mode == Mode::Grid);
+        assert!(!app.sdr_preview);
+        assert_eq!(app.loaded_count, 0);
+        assert!(app.thumbs.iter().all(Option::is_none));
+        assert!(app.errors.iter().all(Option::is_none));
+    }
+
+    /// Debug helper: dump the welcome tree's SVG + layout to /tmp.
+    /// `cargo test dump_welcome -- --ignored`
+    #[test]
+    #[ignore]
+    fn dump_welcome_artifacts() {
+        let app = GalleryApp::new(Vec::new(), 1, SharedWakeup::default());
+        let theme = Theme::default();
+        let (w, h) = (1280.0, 800.0);
+        let diag = damascene_core::HostDiagnostics::default();
+        let cx = BuildCx::new(&theme)
+            .with_viewport(w, h)
+            .with_diagnostics(&diag);
+        let mut tree = app.build(&cx);
+        let bundle = render_bundle_themed(&mut tree, Rect::new(0.0, 0.0, w, h), &theme);
+        std::fs::write("/tmp/welcome.svg", &bundle.svg).unwrap();
+        std::fs::write("/tmp/welcome-tree.txt", &bundle.tree_dump).unwrap();
+    }
+
+    #[test]
+    fn welcome_tree_lints_clean() {
+        let mut app = GalleryApp::new(Vec::new(), 1, SharedWakeup::default());
+        let findings = lint_findings(&app);
+        assert!(
+            findings.is_empty(),
+            "welcome lint findings:\n{}",
+            findings.join("\n")
+        );
+
+        // Empty/unreadable folder reports stay on the welcome screen.
+        app.notice = Some("no supported images in /tmp/empty".into());
+        let findings = lint_findings(&app);
+        assert!(
+            findings.is_empty(),
+            "welcome (notice) lint findings:\n{}",
             findings.join("\n")
         );
     }
