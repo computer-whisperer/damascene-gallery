@@ -43,11 +43,12 @@ jobs:
         with:
           components: clippy
       # wgpu/winit pull in vulkan + wayland/xkb on Linux; the vendored
-      # jpegxr (jxrlib) build needs libclang for bindgen.
+      # jpegxr (jxrlib) build needs libclang for bindgen; image's
+      # avif-native feature links the system dav1d.
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libvulkan-dev libwayland-dev libxkbcommon-dev libclang-dev
+          sudo apt-get install -y libvulkan-dev libwayland-dev libxkbcommon-dev libclang-dev libdav1d-dev
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: damascene-gallery
@@ -69,7 +70,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libvulkan-dev libwayland-dev libxkbcommon-dev libclang-dev
+          sudo apt-get install -y libvulkan-dev libwayland-dev libxkbcommon-dev libclang-dev libdav1d-dev
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: damascene-gallery
