@@ -1,0 +1,7 @@
+/target
+/out
+/.claude
+# makepkg working dir / artifacts
+/pkg
+*.pkg.tar.zst
+*.pkg.tar.zst.sig

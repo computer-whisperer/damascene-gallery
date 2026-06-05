@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Damascene is consumed by path from a sibling checkout (the gallery tracks
+# unreleased damascene APIs — dynamic-range-limit remastering, live color
+# management). CI reproduces the sibling layout by checking out
+# computer-whisperer/damascene@main next to this repo; when the gallery's
+# damascene usage settles onto a published release, switch Cargo.toml to
+# crates.io versions and drop the second checkout. Other dependencies are
+# pinned in the committed Cargo.lock (--locked fails on drift).
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: damascene-gallery
+      - uses: actions/checkout@v5
+        with:
+          repository: computer-whisperer/damascene
+          path: damascene/damascene.main
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # wgpu/winit pull in vulkan + wayland/xkb on Linux; the vendored
+      # jpegxr (jxrlib) build needs libclang for bindgen.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev libwayland-dev libxkbcommon-dev libclang-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: damascene-gallery
+      - run: cargo clippy --all-targets --locked -- -D warnings
+        working-directory: damascene-gallery
+
+  build-test:
+    name: Build + Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: damascene-gallery
+      - uses: actions/checkout@v5
+        with:
+          repository: computer-whisperer/damascene
+          path: damascene/damascene.main
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev libwayland-dev libxkbcommon-dev libclang-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: damascene-gallery
+      - name: Build
+        run: cargo build --all-targets --locked
+        working-directory: damascene-gallery
+      - name: Run tests
+        run: cargo test --locked
+        working-directory: damascene-gallery

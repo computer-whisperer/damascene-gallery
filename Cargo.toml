@@ -1,0 +1,56 @@
+[package]
+name = "damascene-gallery"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Color-managed media gallery — HDR-aware (JPEG XR, JXL, AVIF, EXR, …), Wayland color management via damascene"
+repository = "https://github.com/computer-whisperer/damascene-gallery"
+authors = ["Christian Balcom"]
+
+[dependencies]
+anyhow = "1"
+half = { version = "2.6", features = ["bytemuck"] }
+lru = "0.18"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UI: damascene (path — develop against the local checkout).
+damascene-core = { path = "../damascene/damascene.main/crates/damascene-core" }
+damascene-winit-wgpu = { path = "../damascene/damascene.main/crates/damascene-winit-wgpu" }
+
+# Image input pipeline (src/decode, src/color.rs, src/cms.rs) is copied
+# from prism-bg (which stays unpublished); same decoder stack:
+png = "0.18"
+image = { version = "0.25", default-features = false, features = ["jpeg", "webp", "exr", "hdr", "avif-native"] }
+jxl-oxide = "0.12"
+moxcms = "0.8"
+jpegxr = "0.3"
+
+# jpegxr 0.3.1 vendored (copied with the pipeline): its pinned bindgen
+# 0.69 generates opaque structs with current libclang; bumped to 0.72.
+[patch.crates-io]
+jpegxr = { path = "vendor/jpegxr" }
+
+# MSDF/text crates are ~500x slower unoptimized (per damascene's own
+# profile guidance); image decode is also hot in dev runs.
+[profile.dev.package.fdsm]
+opt-level = 3
+[profile.dev.package.cosmic-text]
+opt-level = 3
+[profile.dev.package.jpegxr]
+opt-level = 3
+[profile.dev.package.jxl-oxide]
+opt-level = 3
+[profile.dev.package.jxl-render]
+opt-level = 3
+[profile.dev.package.jxl-vardct]
+opt-level = 3
+[profile.dev.package.jxl-modular]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.moxcms]
+opt-level = 3
