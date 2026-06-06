@@ -576,8 +576,6 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 [[package]]
 name = "damascene-core"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c478ffaa9b55748cbf70bc891f431b24e27043f308a983adc32076e490489056"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -602,8 +600,6 @@ dependencies = [
 [[package]]
 name = "damascene-fonts"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e02f605cc39d9f70c6cb2ed53d364b1c6a2cd9f88cab16a58b48fcd8ce5ba04"
 dependencies = [
  "damascene-fonts-emoji",
  "damascene-fonts-inter",
@@ -614,26 +610,18 @@ dependencies = [
 [[package]]
 name = "damascene-fonts-emoji"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae1de66882e6a31d3e40da0494c558b80f24bf07cf0a7900ddf442a7eefa5434"
 
 [[package]]
 name = "damascene-fonts-inter"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d084c112dab32387b62226e862f0c13fda21b380da54abdb2cc7a35ec22fffe"
 
 [[package]]
 name = "damascene-fonts-jetbrains-mono"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfd4c719004dc049baa73e4e869cca40c02532f5327ac118b3bb4fcc43a57cdc"
 
 [[package]]
 name = "damascene-fonts-symbols"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0d8aa98fba560c659beac4f4a798cb002bfe908c8c26c3a8eb3195ab9ee0776"
 
 [[package]]
 name = "damascene-gallery"
@@ -657,8 +645,6 @@ dependencies = [
 [[package]]
 name = "damascene-wgpu"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b1386ea452797bf76deb966646656ba0916ec93e193efdfbdc284c9edb2e5a2"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -671,8 +657,6 @@ dependencies = [
 [[package]]
 name = "damascene-winit-wgpu"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3089573057c28327042779f14463da511467abe0a722153f1bcc4971f9aa04d"
 dependencies = [
  "arboard",
  "damascene-core",
