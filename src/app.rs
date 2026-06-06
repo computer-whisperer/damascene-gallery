@@ -14,7 +14,7 @@ use std::sync::mpsc::{channel, Receiver};
 
 use damascene_core::prelude::*;
 use damascene_core::scroll::{ScrollAlignment, ScrollRequest};
-use damascene_core::{BuildCx, KeyChord, UiEvent, UiEventKind, UiKey};
+use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind, UiKey};
 use lru::LruCache;
 
 use crate::convert::ImageMeta;
@@ -513,7 +513,7 @@ impl App for GalleryApp {
         ]
     }
 
-    fn on_event(&mut self, event: UiEvent) {
+    fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         // Folder picking works from every screen (welcome button, grid
         // toolbar button, `o` anywhere).
         if event.is_click_or_activate("open-folder") || event.is_hotkey("open-folder") {
