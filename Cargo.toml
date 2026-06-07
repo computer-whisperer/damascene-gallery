@@ -18,10 +18,9 @@ rfd = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# UI: damascene (path — develop against the local checkout while the
-# Wayland white-scale fix is unreleased).
-damascene-core = { path = "../damascene/damascene.main/crates/damascene-core" }
-damascene-winit-wgpu = { path = "../damascene/damascene.main/crates/damascene-winit-wgpu" }
+# UI: damascene (crates.io — 0.4.2 includes the Wayland white-scale fix).
+damascene-core = "0.4.2"
+damascene-winit-wgpu = "0.4.2"
 
 # Image input pipeline (src/decode, src/color.rs, src/cms.rs) is copied
 # from prism-bg (which stays unpublished); same decoder stack:
