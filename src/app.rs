@@ -403,10 +403,33 @@ impl GalleryApp {
         let mut detail = format!("{} / {}", i + 1, self.files.len());
         if let Some(m) = meta {
             detail.push_str(&format!(" · {}×{} · {}", m.width, m.height, m.encoding));
-            if let Some(peak) = m.peak_nits {
-                detail.push_str(&format!(" · peak {peak:.0} nits"));
+            if let Some(bytes) = m.file_bytes {
+                detail.push_str(&format!(" · {}", human_bytes(bytes)));
             }
         }
+
+        // Measured pixel stats (linear, ×reference white) next to what
+        // the metadata declared — the interesting gap for HDR files.
+        let stats_line = meta.map(|m| {
+            let s = &m.stats;
+            let max = s.max_rgb[0].max(s.max_rgb[1]).max(s.max_rgb[2]);
+            let mut t = format!(
+                "max RGB {:.2} / {:.2} / {:.2} ×ref · peak {:.0} nits measured",
+                s.max_rgb[0],
+                s.max_rgb[1],
+                s.max_rgb[2],
+                max * m.reference_nits,
+            );
+            if let Some(declared) = m.peak_nits {
+                t.push_str(&format!(", {declared:.0} declared"));
+            }
+            t.push_str(&format!(
+                " · mean luminance {:.3} · {:.1}% above ref white",
+                s.mean_luminance,
+                s.above_reference * 100.0,
+            ));
+            t
+        });
 
         let mut bar = vec![
             text(self.names[i].clone()).bold(),
@@ -424,12 +447,19 @@ impl GalleryApp {
         }
         bar.push(text("t = SDR preview · Esc to close").caption().muted());
 
+        let mut info = vec![row_el(bar)
+            .gap(tokens::SPACE_3)
+            .align(Align::Center)
+            .width(Size::Fill(1.0))];
+        if let Some(stats) = stats_line {
+            info.push(text(stats).caption().muted());
+        }
+
         column([
             canvas,
-            card([row_el(bar)
-                .gap(tokens::SPACE_3)
+            card([column(info)
+                .gap(tokens::SPACE_2)
                 .padding(tokens::SPACE_3)
-                .align(Align::Center)
                 .width(Size::Fill(1.0))])
             .width(Size::Fill(1.0)),
         ])
@@ -580,6 +610,20 @@ impl App for GalleryApp {
     }
 }
 
+/// Decimal units, matching what file managers show.
+fn human_bytes(b: u64) -> String {
+    let b = b as f64;
+    if b >= 1e9 {
+        format!("{:.2} GB", b / 1e9)
+    } else if b >= 1e6 {
+        format!("{:.1} MB", b / 1e6)
+    } else if b >= 1e3 {
+        format!("{:.0} kB", b / 1e3)
+    } else {
+        format!("{b:.0} B")
+    }
+}
+
 /// `row` the layout constructor collides with `row` loop variables; tiny
 /// alias keeps call sites readable.
 fn row_el<I: IntoIterator<Item = El>>(children: I) -> El {
@@ -642,6 +686,13 @@ mod tests {
                 height: 2160,
                 encoding: "fp16 linear / sRGB".into(),
                 peak_nits: Some(1000.0),
+                reference_nits: 80.0,
+                stats: crate::convert::PixelStats {
+                    max_rgb: [12.48, 11.20, 8.91],
+                    mean_luminance: 0.182,
+                    above_reference: 0.234,
+                },
+                file_bytes: Some(24_300_000),
             });
             app.loaded_count += 1;
         }

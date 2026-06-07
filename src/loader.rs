@@ -212,7 +212,8 @@ fn worker(shared: Arc<Shared>) {
         let path = &shared.files[index];
         let result = match decode::load_straight(path) {
             Ok(decoded) => {
-                let meta = convert::meta_of(&decoded);
+                let mut meta = convert::meta_of(&decoded);
+                meta.file_bytes = std::fs::metadata(path).ok().map(|m| m.len());
                 match kind {
                     JobKind::Thumb => Loaded::Thumb {
                         index,

@@ -32,6 +32,26 @@ pub struct ImageMeta {
     pub encoding: String,
     /// Declared peak luminance in nits, when the source said.
     pub peak_nits: Option<f64>,
+    /// Reference white in nits — converts the relative [`PixelStats`]
+    /// to absolute luminance.
+    pub reference_nits: f32,
+    /// Measured over the actual pixels, not declared by metadata.
+    pub stats: PixelStats,
+    /// Source file size in bytes (filled by the loader, which has the path).
+    pub file_bytes: Option<u64>,
+}
+
+/// Single-pass measurements over the decoded pixels, in linear light
+/// where 1.0 = the source's reference white.
+#[derive(Debug, Clone, Copy)]
+pub struct PixelStats {
+    /// Per-channel maxima.
+    pub max_rgb: [f32; 3],
+    /// Mean relative luminance (Y row of the RGB→XYZ matrix for the
+    /// source primaries).
+    pub mean_luminance: f32,
+    /// Fraction of pixels with any channel above reference white.
+    pub above_reference: f32,
 }
 
 pub fn meta_of(img: &DecodedImage) -> ImageMeta {
@@ -60,6 +80,102 @@ pub fn meta_of(img: &DecodedImage) -> ImageMeta {
         height: img.height,
         encoding: format!("{depth} {tf} / {prim}{alpha}"),
         peak_nits: enc.luminances.map(|l| l.max),
+        reference_nits: reference_nits(img),
+        stats: stats_of(img),
+        file_bytes: None,
+    }
+}
+
+/// Reference white for anchoring relative linear values, by the same
+/// rules the conversion paths use: the declared reference when present,
+/// else BT.2408's 203 cd/m² for PQ and the tag default otherwise.
+fn reference_nits(img: &DecodedImage) -> f32 {
+    let declared = img.encoding.luminances.map(|l| l.reference as f32);
+    match img.encoding.tf {
+        Tf::Pq => declared.unwrap_or(PQ_DEFAULT_REF_NITS),
+        Tf::Linear => declared.unwrap_or(ColorSpace::SCRGB_LINEAR.reference_luminance_nits),
+        _ => declared.unwrap_or(ColorSpace::SRGB.reference_luminance_nits),
+    }
+}
+
+/// The source's decode-to-linear mapping, 1.0 = reference white. prism's
+/// `Tf::eotf` is deliberately undefined for PQ (it never converts PQ
+/// client-side); here the absolute anchor is explicit, so PQ routes
+/// through `pq_eotf` and everything else through the TF's own EOTF.
+fn linearizer(img: &DecodedImage) -> impl Fn(f32) -> f32 {
+    let tf = img.encoding.tf;
+    let pq_scale = match tf {
+        Tf::Pq => 10_000.0 / reference_nits(img),
+        _ => 1.0,
+    };
+    move |v: f32| match tf {
+        Tf::Pq => pq_eotf(v) * pq_scale,
+        _ => tf.eotf(v),
+    }
+}
+
+/// Y row of the RGB→XYZ matrix for the named volumes; custom primaries
+/// snap like [`map_primaries`], unmatched ones get the BT.2020 weights.
+fn luma_weights(p: PrimaryVolume) -> [f32; 3] {
+    match p.snap_to_named(0.01) {
+        PrimaryVolume::Srgb => [0.2126, 0.7152, 0.0722],
+        PrimaryVolume::DisplayP3 => [0.2290, 0.6917, 0.0793],
+        _ => [0.2627, 0.6780, 0.0593],
+    }
+}
+
+/// One streaming pass over the pixels — no allocation beyond the 8-bit
+/// LUT; decode time dominates this on the worker threads.
+fn stats_of(img: &DecodedImage) -> PixelStats {
+    let lin = linearizer(img);
+    let [kr, kg, kb] = luma_weights(img.encoding.primaries);
+    let mut max = [0.0f32; 3];
+    let mut luma = 0.0f64;
+    let mut above = 0u64;
+    let mut acc = |r: f32, g: f32, b: f32| {
+        max[0] = max[0].max(r);
+        max[1] = max[1].max(g);
+        max[2] = max[2].max(b);
+        luma += (kr * r + kg * g + kb * b) as f64;
+        if r > 1.0 || g > 1.0 || b > 1.0 {
+            above += 1;
+        }
+    };
+    match &img.pixels {
+        Pixels::Rgba8(d) => {
+            let lut: Vec<f32> = (0..=255u32).map(|v| lin(v as f32 / 255.0)).collect();
+            for px in d.chunks_exact(4) {
+                acc(
+                    lut[px[0] as usize],
+                    lut[px[1] as usize],
+                    lut[px[2] as usize],
+                );
+            }
+        }
+        Pixels::Rgba16(d) => {
+            for px in d.chunks_exact(4) {
+                acc(
+                    lin(px[0] as f32 / 65535.0),
+                    lin(px[1] as f32 / 65535.0),
+                    lin(px[2] as f32 / 65535.0),
+                );
+            }
+        }
+        Pixels::RgbaF16(d) => {
+            for px in d.chunks_exact(4) {
+                acc(
+                    lin(px[0].to_f32()),
+                    lin(px[1].to_f32()),
+                    lin(px[2].to_f32()),
+                );
+            }
+        }
+    }
+    let n = (img.width as u64 * img.height as u64).max(1);
+    PixelStats {
+        max_rgb: max,
+        mean_luminance: (luma / n as f64) as f32,
+        above_reference: above as f32 / n as f32,
     }
 }
 
@@ -235,28 +351,8 @@ pub fn thumbnail(img: &DecodedImage, max_edge: u32) -> Image {
 /// where 1.0 = SDR reference white. Returns the pixel data and the
 /// reference luminance to carry on the tag.
 fn to_linear_f32(img: &DecodedImage) -> (Vec<f32>, f32) {
-    let tf = img.encoding.tf;
-    let pq_ref = img
-        .encoding
-        .luminances
-        .map(|l| l.reference as f32)
-        .unwrap_or(PQ_DEFAULT_REF_NITS);
-    let pq_scale = 10_000.0 / pq_ref;
-    let ref_nits = match tf {
-        Tf::Pq => pq_ref,
-        _ => img
-            .encoding
-            .luminances
-            .map(|l| l.reference as f32)
-            .unwrap_or(ColorSpace::SRGB.reference_luminance_nits),
-    };
-    // prism's Tf::eotf is deliberately undefined for PQ (it never converts
-    // PQ client-side); here the absolute anchor is explicit, so route PQ
-    // through pq_eotf and everything else through the TF's own EOTF.
-    let lin = |v: f32| match tf {
-        Tf::Pq => pq_eotf(v) * pq_scale,
-        _ => tf.eotf(v),
-    };
+    let lin = linearizer(img);
+    let ref_nits = reference_nits(img);
 
     let n = (img.width as usize) * (img.height as usize) * 4;
     let mut out = Vec::with_capacity(n);
@@ -385,6 +481,59 @@ mod tests {
         // dest 1 covers [1.5, 3): (0.5*0.6 + 1.0) / 1.5 ≈ 0.8667
         assert!((out[0] - 0.2).abs() < 1e-6, "got {}", out[0]);
         assert!((out[4] - 0.866_666_7).abs() < 1e-6, "got {}", out[4]);
+    }
+
+    /// Stats measure in linear light anchored at reference white: an
+    /// scRGB f16 source passes through, an sRGB 8-bit source decodes
+    /// through the EOTF, and `above_reference` counts pixels, not
+    /// channels.
+    #[test]
+    fn stats_measure_linear_maxima() {
+        use crate::color::{ColorEncoding, Tf};
+
+        // 2×1 scRGB linear: one HDR pixel (R hottest), one in range.
+        let hdr = DecodedImage {
+            width: 2,
+            height: 1,
+            pixels: Pixels::RgbaF16(
+                [4.0f32, 2.0, 1.5, 1.0, 0.25, 0.5, 1.0, 1.0]
+                    .iter()
+                    .map(|&v| half::f16::from_f32(v))
+                    .collect(),
+            ),
+            encoding: ColorEncoding {
+                tf: Tf::Linear,
+                primaries: PrimaryVolume::Srgb,
+                luminances: None,
+            },
+            has_alpha: false,
+        };
+        let s = stats_of(&hdr);
+        assert_eq!(s.max_rgb, [4.0, 2.0, 1.5]);
+        assert_eq!(s.above_reference, 0.5); // one of two pixels
+        let [kr, kg, kb] = luma_weights(PrimaryVolume::Srgb);
+        let want = (kr * 4.0 + kg * 2.0 + kb * 1.5 + kr * 0.25 + kg * 0.5 + kb * 1.0) / 2.0;
+        assert!((s.mean_luminance - want).abs() < 1e-6);
+
+        let meta = meta_of(&hdr);
+        assert_eq!(meta.stats.max_rgb, [4.0, 2.0, 1.5]);
+        assert_eq!(
+            meta.reference_nits,
+            ColorSpace::SCRGB_LINEAR.reference_luminance_nits
+        );
+
+        // 1×1 sRGB 8-bit full white: maxima decode to exactly 1.0 and
+        // nothing exceeds reference.
+        let sdr = DecodedImage {
+            width: 1,
+            height: 1,
+            pixels: Pixels::Rgba8(vec![255, 255, 255, 255]),
+            encoding: ColorEncoding::SRGB,
+            has_alpha: false,
+        };
+        let s = stats_of(&sdr);
+        assert_eq!(s.max_rgb, [1.0, 1.0, 1.0]);
+        assert_eq!(s.above_reference, 0.0);
     }
 
     /// End-to-end against the real collection when it's mounted: decode
